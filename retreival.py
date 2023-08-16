@@ -1,6 +1,5 @@
 import PyPDF2
 
-from langchain.document_loaders import PyPDFLoader
 from langchain.chat_models import ChatOpenAI
 import langchain
 import bs4
@@ -11,18 +10,19 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 import asyncio
 from langchain.docstore.document import Document
 from langchain.chains.summarize import load_summarize_chain
-from langchain import PromptTemplate, LLMChain
 import tiktoken
 import aiohttp
-from langchain.prompts import (
-    ChatPromptTemplate,
-    HumanMessagePromptTemplate,
-    SystemMessagePromptTemplate
-)
+from reliablegpt import reliableGPT
+import openai
+from gptcache import cache
+from gptcache.adapter import openai
 
+cache.init()
+cache.set_openai_key()
+with open('email.txt','r') as f:
+    email =  f.readline()
+openai.ChatCompletion.create = reliableGPT(openai.ChatCompletion.create, user_email= email)
 
-
-llm = ChatOpenAI(model = 'gpt-3.5-turbo',temperature=0)
 executor = ThreadPoolExecutor(max_workers=5)
 
 content_string = '''\
@@ -30,20 +30,22 @@ You are SummarizeGPT, a LLM that summarizes research papers into their main idea
 Suggest a title for the summarised content and write a concise and comprehensive summary of the paper.
  '''
 
-system_message_prompt = SystemMessagePromptTemplate.from_template(content_string)
-human_template = "{text}"
-human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
-chat_prompt = ChatPromptTemplate.from_messages([system_message_prompt, human_message_prompt])
-
+tagger_string = '''\
+You are TaggerGPT, a LLM that tags research papers with their respective fields. Given the content of a paper, suggest a title and tag the paper with the appropriate field.
+The given tags allowed are the following: Language, Vision, RL, Alignment, Robotics, Audio and Miscellaneous.
+You can give more than 1 tag to the paper if you think it is appropriate. You will only respond with the tag, and will delimit multiple tags with commas. 
+'''
 
 def count_tokens(text):
     tokenizer = tiktoken.encoding_for_model('gpt-3.5-turbo')
     tokens = tokenizer.encode(text)
     return len(tokens)
 
+tag_prompt_len = count_tokens(tagger_string)
+
 template_len = count_tokens(content_string)
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=2000 - template_len,
+    chunk_size=3200 - template_len,
     chunk_overlap=100,
     length_function=count_tokens,
     separators=["\n\n","\n",'']
@@ -51,16 +53,20 @@ text_splitter = RecursiveCharacterTextSplitter(
 
 
 
-def scrape_hf(url):
+def scrape_hf(url,current_posts= []):
     response = requests.get(url)
     soup = bs4.BeautifulSoup(response.text, 'html.parser')
     sections = soup.find_all('article', class_ = 'flex flex-col overflow-hidden rounded-xl border')
     hyperlink_texts = [section.find('h3') for section in sections]
+    upvotes = [section.find('div', class_ = 'leading-none').text for section in sections]
+    upvotes = list(map(lambda x: int(x) if x !='-' else 0,upvotes))
     results = []
-    for text in hyperlink_texts:
+    filtered = []
+    for count,text in enumerate(hyperlink_texts):
         data = text.find('a', class_ = 'cursor-pointer')
-        results.append((data.text,data['href'].replace('papers','pdf')))
-    return results
+        results.append((upvotes[count],data.text,data['href'].replace('papers','pdf')))
+    filtered = list(filter(lambda x: x[0] >8,results))
+    return filtered if len(filtered)>=3 else results[:3]
 
 async def scrape_arxiv(codes,batch_size = 5):
     texts = []
@@ -98,7 +104,8 @@ def parse_pdf_sync(pdf_data):
 async def process_pdf(session,url):
     pdf_text = await  parse_pdf(session,url)
     result = await summarize(pdf_text)
-    return result
+    tags = await tagger(result)
+    return (tags,result)
 
 ##Count tokens then summarize
 async def summarize(text):
@@ -111,22 +118,57 @@ async def summarize(text):
             break
         else:
             docs.append(portion)
-    results = [async_generate(chat_prompt,doc) for doc in docs]
+    results = [async_generate(content_string,doc) for doc in docs]
     results = await asyncio.gather(*results)
-    return ''.join(results) if len(docs) == 1 else '\n\n'.join(results)
+    out = ''.join(results) if len(docs) == 1 else '\n\n'.join(results)
+    if count_tokens(out) > 4000:
+        print('Summarizing summary......')
+        return await summarize(out)
+    else:
+        results = await async_generate(content_string,out)
+        print('Paper summarized!')
+    return results
 
 async def async_generate(prompt,text):
-    print(prompt.format_prompt(text = text).to_messages())
-    return await llm.agenerate(prompt.format_prompt(text = text).to_messages())
+    print('Calling API to generate.......')
+    messages = [{'role':'system','content':prompt},{'role':'user','content':text}]
+    res = openai.ChatCompletion.create(
+        model = 'gpt-3.5-turbo',
+        messages = messages,
+    )
+    return res['choices'][0]['message']['content']
 
+async def tagger(text):
+    while count_tokens(text) >= 4000:
+        text = text[:-50] #Truncate the text until it is below 4000 tokens
+    results = await async_generate(tagger_string,text)
+    return results
+
+##### DISCORD LOGIC ########
+
+def format_post(post):
+    if '\n\nSummary:' in post:
+        post = 'Summary:'+post.split('\n\nSummary:')[1]
+        return post
+
+def format_tags(tags):
+    approved_tags = {'Language','Vision','RL','Alignment','Robotics','Audio','Miscellaneous'}
+    print(tags)
+    ##Validate and format tags
+    if 'Tags:' in tags:
+        post_tags = tags.split('Tags:')[1].split(',')
+        valid_tags = {tag.strip() for tag in post_tags} & approved_tags
+    return ', '.join(valid_tags) if valid_tags else 'Miscellaneous'
+        
 async def main():
     res = scrape_hf('https://huggingface.co/papers')
-    names,codes = zip(*res)
-        
-    posts = await scrape_arxiv(codes)
-    for post in zip(names,codes,posts):
+    _,names,codes = zip(*res)
+    tags,posts = zip(*await scrape_arxiv(codes))
+    posts = list(map(format_post,posts))
+    tags = list(map(format_tags,tags))
+    for post in zip(names,codes,posts,tags):
         print(
-            f"{post[0]}: {post[1]}\n\n{post[2]}"
+            f"{post[0]}: https://arxiv.org{post[1]}.pdf\n\n{post[2]}\nTags given: {post[3]}\n"
         )
         
 
